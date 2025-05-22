@@ -1,16 +1,16 @@
-fopen_override
-==============
+xover
+=====
 
-LD_PRELOAD-based fopen/open filename overrider
+LD_PRELOAD-based filename/dir overrider
 
 Example:
 
-    LD_PRELOAD=libfopen_override.so FOPEN_OVERRIDE=/etc/ppp/chap-secrets=/root/encfs/chap-secrets pppd ...
+    LD_PRELOAD=xover.so XOVER=/etc/ppp/chap-secrets=/root/encfs/chap-secrets pppd ...
 
 Non-working example:
 
-    LD_PRELOAD=libfopen_override.so FOPEN_OVERRIDE=/etc/resolv.conf=/tmp/tmpresolv.conf ping google.com
+    LD_PRELOAD=xover.so XOVER=/etc/resolv.conf=/tmp/tmpresolv.conf ping google.com
 
 Tricky example:
 
-    LD_PRELOAD=libfopen_override.so FOPEN_OVERRIDE='debug,noabs,qqq1=www1,../filename\,with\,comma=../filename\=with\=eqsign' program [args...]
+    LD_PRELOAD=xover.so XOVER='debug,noabs,qqq1=www1,../filename\,with\,comma=../filename\=with\=eqsign' program [args...]
