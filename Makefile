@@ -1,4 +1,10 @@
+DEBUG_BUILD ?= 0
+CC ?= cc
+
 all: libfopen_override.so
 
 libfopen_override.so: override.c
-	${CC} ${CFLAGS} ${LDFLAGS} -Wall -g3 -shared -fPIC -ldl  -o $@ $<
+	${CC} -DDEBUG_BUILD=$(DEBUG_BUILD) -S -Wall -pedantic -O2 -shared -fPIC -o $@ $<
+
+clean:
+	rm -f libfopen_override.so
