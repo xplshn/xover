@@ -91,11 +91,6 @@ struct orig_funcs {
     DIR *(*opendir)(const char *name);
     ssize_t (*readlink)(const char *pathname, char *buf, size_t bufsiz);
     ssize_t (*readlinkat)(int dirfd, const char *pathname, char *buf, size_t bufsiz);
-#ifdef __GLIBC__
-    int (*stat64)(const char *pathname, struct stat64 *statbuf);
-    int (*lstat64)(const char *pathname, struct stat64 *statbuf);
-    int (*fstatat64)(int dirfd, const char *pathname, struct stat64 *statbuf, int flags);
-#endif
 };
 
 static struct orig_funcs orig = {0};
@@ -838,97 +833,3 @@ ssize_t readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsiz)
 {
     return xover_readlinkat(dirfd, pathname, buf, bufsiz);
 }
-
-#ifdef __GLIBC__
-/* GLIBC-specific 64-bit variants */
-static int xover_stat64(const char *pathname, struct stat64 *statbuf)
-{
-    if (!config.is_initialized) {
-        parse_config();
-    }
-    if (!config.is_initialized) {
-        return -1;
-    }
-
-    char pathbuf[MAXPATH];
-    const char *resolved = resolve_path(pathname, AT_FDCWD, pathbuf, sizeof(pathbuf));
-    if (!resolved) {
-        return -1;
-    }
-
-    if (!orig.stat64) {
-        func_ptr_union u;
-        u.void_ptr = get_orig_func("stat64");
-        orig.stat64 = u.stat_func;
-        if (!orig.stat64) return -1;
-    }
-
-    return orig.stat64(resolved, statbuf);
-}
-
-static int xover_lstat64(const char *pathname, struct stat64 *statbuf)
-{
-    if (!config.is_initialized) {
-        parse_config();
-    }
-    if (!config.is_initialized) {
-        return -1;
-    }
-
-    char pathbuf[MAXPATH];
-    const char *resolved = resolve_path(pathname, AT_FDCWD, pathbuf, sizeof(pathbuf));
-    if (!resolved) {
-        return -1;
-    }
-
-    if (!orig.lstat64) {
-        func_ptr_union u;
-        u.void_ptr = get_orig_func("lstat64");
-        orig.lstat64 = u.lstat_func;
-        if (!orig.lstat64) return -1;
-    }
-
-    return orig.lstat64(resolved, statbuf);
-}
-
-static int xover_fstatat64(int dirfd, const char *pathname, struct stat64 *statbuf, int flags)
-{
-    if (!config.is_initialized) {
-        parse_config();
-    }
-    if (!config.is_initialized) {
-        return -1;
-    }
-
-    char pathbuf[MAXPATH];
-    const char *resolved = resolve_path(pathname, dirfd, pathbuf, sizeof(pathbuf));
-    if (!resolved) {
-        return -1;
-    }
-
-    if (!orig.fstatat64) {
-        func_ptr_union u;
-        u.void_ptr = get_orig_func("fstatat64");
-        orig.fstatat64 = u.fstatat_func;
-        if (!orig.fstatat64) return -1;
-    }
-
-    return orig.fstatat64(dirfd, resolved, statbuf, flags);
-}
-
-int stat64(const char *pathname, struct stat64 *statbuf)
-{
-    return xover_stat64(pathname, statbuf);
-}
-
-int lstat64(const char *pathname, struct stat64 *statbuf)
-{
-    return xover_lstat64(pathname, statbuf);
-}
-
-int fstatat64(int dirfd, const char *pathname, struct stat64 *statbuf, int flags)
-{
-    return xover_fstatat64(dirfd, pathname, statbuf, flags);
-}
-#endif
-
