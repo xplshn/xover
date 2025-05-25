@@ -8,6 +8,8 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <stdarg.h>
+#include <sys/syscall.h>
+#include <ftw.h>
 
 typedef union {
     void *void_ptr;
@@ -22,8 +24,19 @@ typedef union {
     int (*rmdir_func)(const char *);
     int (*unlinkat_func)(int, const char *, int);
     DIR *(*opendir_func)(const char *);
+    struct dirent *(*readdir_func)(DIR *);
+    struct dirent64 *(*readdir64_func)(DIR *);
+    int (*scandir_func)(const char *, struct dirent ***, int (*)(const struct dirent *), int (*)(const struct dirent **, const struct dirent **));
+    int (*scandir64_func)(const char *, struct dirent64 ***, int (*)(const struct dirent64 *), int (*)(const struct dirent64 **, const struct dirent64 **));
+    int (*getdents_func)(int, struct dirent *, unsigned int);
+    long (*getdents64_func)(int, void *, unsigned long);
+    #ifdef FTW
+    int (*ftw_func)(const char *, int (*)(const char *, const struct stat *, int), int);
+    int (*nftw_func)(const char *, int (*)(const char *, const struct stat *, int, struct FTW *), int, int);
+    #endif
     ssize_t (*readlink_func)(const char *, char *, size_t);
     ssize_t (*readlinkat_func)(int, const char *, char *, size_t);
+    int (*closedir_func)(DIR *);
 } func_ptr_union;
 
 /* File access flags */
@@ -83,7 +96,7 @@ static struct xover_cfg config = {
 };
 
 /* Original function pointers */
-struct orig_funcs {
+static struct {
     int (*openat)(int dirfd, const char *pathname, int flags, mode_t mode);
     int (*stat)(const char *pathname, struct stat *statbuf);
     int (*lstat)(const char *pathname, struct stat *statbuf);
@@ -95,11 +108,18 @@ struct orig_funcs {
     int (*rmdir)(const char *pathname);
     int (*unlinkat)(int dirfd, const char *pathname, int flags);
     DIR *(*opendir)(const char *name);
+    struct dirent *(*readdir)(DIR *dirp);
+    struct dirent64 *(*readdir64)(DIR *dirp);
+    int (*scandir)(const char *, struct dirent ***, int (*)(const struct dirent *), int (*)(const struct dirent **, const struct dirent **));
+    int (*scandir64)(const char *, struct dirent64 ***, int (*)(const struct dirent64 *), int (*)(const struct dirent64 **, const struct dirent64 **));
+    int (*getdents)(int, struct dirent *, unsigned int);
+    long (*getdents64)(int, void *, unsigned long);
+    int (*ftw)(const char *, int (*)(const char *, const struct stat *, int), int);
+    int (*nftw)(const char *, int (*)(const char *, const struct stat *, int, struct FTW *), int, int);
     ssize_t (*readlink)(const char *pathname, char *buf, size_t bufsiz);
     ssize_t (*readlinkat)(int dirfd, const char *pathname, char *buf, size_t bufsiz);
-};
-
-static struct orig_funcs orig = {0};
+    int (*closedir)(DIR *dirp);
+} orig = {0};
 
 /* Convert fopen mode string to open flags */
 static int mode_to_flags(const char *mode)
@@ -176,13 +196,48 @@ static int absolutize_path(char *outpath, int outpath_size, const char *pathname
     return 0;
 }
 
-/* Resolve path through override table */
+/* Check if path starts with prefix, handling trailing slashes */
+static int path_starts_with(const char *path, const char *prefix)
+{
+    size_t prefix_len = strlen(prefix);
+    size_t path_len = strlen(path);
+
+    /* Path must be at least as long as prefix */
+    if (path_len < prefix_len) {
+        return 0;
+    }
+
+    /* Check if prefix matches */
+    if (strncmp(path, prefix, prefix_len) != 0) {
+        return 0;
+    }
+
+    /* If path is exactly the prefix, it matches */
+    if (path_len == prefix_len) {
+        return 1;
+    }
+
+    /* If prefix ends with '/', path can continue with anything */
+    if (prefix[prefix_len - 1] == '/') {
+        return 1;
+    }
+
+    /* If path continues with '/', it's a subdirectory */
+    if (path[prefix_len] == '/') {
+        return 1;
+    }
+
+    return 0;
+}
+
 static const char *resolve_path(const char *pathname, int dirfd, char *pathbuf, size_t pathbuf_size)
 {
     const char *resolved = pathname;
+    static char result_buf[MAXPATH];
 
     if (config.do_absolutize) {
         if (absolutize_path(pathbuf, pathbuf_size, pathname, dirfd) == -1) {
+            fprintf(stderr, "xover: error: failed to absolutize path %s\n", pathname);
             return NULL;
         }
         resolved = pathbuf;
@@ -192,12 +247,51 @@ static const char *resolve_path(const char *pathname, int dirfd, char *pathbuf, 
         }
     }
 
-    /* Look up override */
+    /* Look up override - check both exact matches and directory prefixes */
     for (int i = 0; i < config.n_overrides; i++) {
         if (strcmp(resolved, config.paths_from[i]) == 0) {
+            /* Exact match */
             resolved = config.paths_to[i];
             if (config.DEBUG_MODE_VAR >= 1) {
-                fprintf(stderr, "xover: %soverridden%s: %s%s%s with %s%s%s\n", RED, RESET, BLUE, resolved, RESET, BLUE, config.paths_from[i], RESET);
+                fprintf(stderr, "xover: %sexact match%s: %s%s%s -> %s%s%s\n",
+                       RED, RESET, BLUE, config.paths_from[i], RESET, BLUE, resolved, RESET);
+            }
+            break;
+        } else if (path_starts_with(resolved, config.paths_from[i])) {
+            /* Directory prefix match */
+            size_t from_len = strlen(config.paths_from[i]);
+            size_t to_len = strlen(config.paths_to[i]);
+
+            /* Calculate remaining part after the prefix */
+            const char *remaining = resolved + from_len;
+
+            /* Remove leading slash from remaining if prefix doesn't end with slash */
+            if (remaining[0] == '/' && config.paths_from[i][from_len-1] != '/') {
+                remaining++;
+            }
+
+            /* Build new path: to_path + remaining */
+            if (to_len + strlen(remaining) + 2 >= sizeof(result_buf)) {
+                fprintf(stderr, "xover: error: path too long for %s and %s\n", config.paths_to[i], remaining);
+                errno = ERANGE;
+                return NULL;
+            }
+
+            strcpy(result_buf, config.paths_to[i]);
+
+            /* Add separator if needed */
+            if (strlen(remaining) > 0) {
+                if (result_buf[to_len-1] != '/' && remaining[0] != '/') {
+                    strcat(result_buf, "/");
+                }
+                strcat(result_buf, remaining);
+            }
+
+            resolved = result_buf;
+
+            if (config.DEBUG_MODE_VAR >= 1) {
+                fprintf(stderr, "xover: %sdir match%s: %s%s%s -> %s%s%s\n",
+                       RED, RESET, BLUE, pathname, RESET, BLUE, resolved, RESET);
             }
             break;
         }
@@ -693,8 +787,330 @@ static DIR *xover_opendir(const char *pathname)
         if (!orig.opendir) return NULL;
     }
 
-    return orig.opendir(resolved);
+    DIR *dir = orig.opendir(resolved);
+    if (dir && config.DEBUG_MODE_VAR >= 2) {
+        fprintf(stderr, "xover: opendir: opened %s (resolved to %s)\n", pathname, resolved);
+    }
+    return dir;
 }
+
+/* Wrapper structure to store original path for directory operations */
+struct dir_wrapper {
+    DIR *dirp;
+    char orig_path[MAXPATH];
+};
+
+/* Global storage for directory wrappers */
+#define MAX_DIRS 128
+static struct dir_wrapper dir_wrappers[MAX_DIRS];
+static int n_dir_wrappers = 0;
+
+/* Find or create a directory wrapper */
+static struct dir_wrapper *get_dir_wrapper(DIR *dirp, const char *orig_path)
+{
+    for (int i = 0; i < n_dir_wrappers; i++) {
+        if (dir_wrappers[i].dirp == dirp) {
+            return &dir_wrappers[i];
+        }
+    }
+
+    if (n_dir_wrappers >= MAX_DIRS) {
+        errno = ENOMEM;
+        return NULL;
+    }
+
+    struct dir_wrapper *wrapper = &dir_wrappers[n_dir_wrappers++];
+    wrapper->dirp = dirp;
+    if (orig_path) {
+        strncpy(wrapper->orig_path, orig_path, MAXPATH-1);
+        wrapper->orig_path[MAXPATH-1] = '\0';
+    } else {
+        wrapper->orig_path[0] = '\0';
+    }
+    return wrapper;
+}
+
+/* Remove a directory wrapper */
+static void remove_dir_wrapper(DIR *dirp)
+{
+    for (int i = 0; i < n_dir_wrappers; i++) {
+        if (dir_wrappers[i].dirp == dirp) {
+            dir_wrappers[i] = dir_wrappers[n_dir_wrappers-1];
+            n_dir_wrappers--;
+            break;
+        }
+    }
+}
+
+static struct dirent *xover_readdir(DIR *dirp)
+{
+    if (!config.is_initialized) {
+        parse_config();
+    }
+    if (!config.is_initialized) {
+        return NULL;
+    }
+
+    if (config.DEBUG_MODE_VAR >= 2) {
+        fprintf(stderr, "xover: readdir: called\n");
+    }
+
+    if (!orig.readdir) {
+        func_ptr_union u;
+        u.void_ptr = get_orig_func("readdir");
+        orig.readdir = u.readdir_func;
+        if (!orig.readdir) return NULL;
+    }
+
+    struct dirent *entry = orig.readdir(dirp);
+    if (entry && config.DEBUG_MODE_VAR >= 2) {
+        fprintf(stderr, "xover: readdir: returned entry %s\n", entry->d_name);
+    }
+
+    if (entry) {
+        struct dir_wrapper *wrapper = get_dir_wrapper(dirp, NULL);
+        if (wrapper && wrapper->orig_path[0] != '\0') {
+            /* Check if this directory was opened with a redirected path */
+            for (int i = 0; i < config.n_overrides; i++) {
+                if (strcmp(wrapper->orig_path, config.paths_from[i]) == 0) {
+                    /* This is a redirected directory, we need to modify the entry */
+                    char new_path[MAXPATH];
+                    snprintf(new_path, MAXPATH, "%s/%s", config.paths_to[i], entry->d_name);
+                    /* For readdir, we just return the original entry as is */
+                    break;
+                }
+            }
+        }
+    }
+
+    return entry;
+}
+
+static struct dirent64 *xover_readdir64(DIR *dirp)
+{
+    if (!config.is_initialized) {
+        parse_config();
+    }
+    if (!config.is_initialized) {
+        return NULL;
+    }
+
+    if (config.DEBUG_MODE_VAR >= 2) {
+        fprintf(stderr, "xover: readdir64: called\n");
+    }
+
+    if (!orig.readdir64) {
+        func_ptr_union u;
+        u.void_ptr = get_orig_func("readdir64");
+        orig.readdir64 = u.readdir64_func;
+        if (!orig.readdir64) return NULL;
+    }
+
+    struct dirent64 *entry = orig.readdir64(dirp);
+    if (entry && config.DEBUG_MODE_VAR >= 2) {
+        // Cast to struct dirent* to safely access d_name
+        struct dirent *dirent_entry = (struct dirent *)entry;
+        fprintf(stderr, "xover: readdir64: returned entry %s\n", dirent_entry->d_name);
+    }
+
+    return entry;
+}
+
+static int xover_scandir(const char *pathname, struct dirent ***namelist,
+                         int (*select)(const struct dirent *),
+                         int (*compar)(const struct dirent **, const struct dirent **))
+{
+    if (!config.is_initialized) {
+        parse_config();
+    }
+    if (!config.is_initialized) {
+        return -1;
+    }
+
+    if (config.DEBUG_MODE_VAR >= 2) {
+        fprintf(stderr, "xover: scandir: %s\n", pathname);
+    }
+
+    char pathbuf[MAXPATH];
+    const char *resolved = resolve_path(pathname, AT_FDCWD, pathbuf, sizeof(pathbuf));
+    if (!resolved) {
+        return -1;
+    }
+
+    if (!orig.scandir) {
+        func_ptr_union u;
+        u.void_ptr = get_orig_func("scandir");
+        orig.scandir = u.scandir_func;
+        if (!orig.scandir) return -1;
+    }
+
+    int ret = orig.scandir(resolved, namelist, select, compar);
+    if (ret >= 0 && config.DEBUG_MODE_VAR >= 2) {
+        fprintf(stderr, "xover: scandir: found %d entries\n", ret);
+    }
+
+    return ret;
+}
+
+static int xover_scandir64(const char *pathname, struct dirent64 ***namelist,
+                           int (*select)(const struct dirent64 *),
+                           int (*compar)(const struct dirent64 **, const struct dirent64 **))
+{
+    if (!config.is_initialized) {
+        parse_config();
+    }
+    if (!config.is_initialized) {
+        return -1;
+    }
+
+    if (config.DEBUG_MODE_VAR >= 2) {
+        fprintf(stderr, "xover: scandir64: %s\n", pathname);
+    }
+
+    char pathbuf[MAXPATH];
+    const char *resolved = resolve_path(pathname, AT_FDCWD, pathbuf, sizeof(pathbuf));
+    if (!resolved) {
+        return -1;
+    }
+
+    if (!orig.scandir64) {
+        func_ptr_union u;
+        u.void_ptr = get_orig_func("scandir64");
+        orig.scandir64 = u.scandir64_func;
+        if (!orig.scandir64) return -1;
+    }
+
+    int ret = orig.scandir64(resolved, namelist, select, compar);
+    if (ret >= 0 && config.DEBUG_MODE_VAR >= 2) {
+        fprintf(stderr, "xover: scandir64: found %d entries\n", ret);
+    }
+
+    return ret;
+}
+
+static int xover_getdents(int fd, struct dirent *dirp, unsigned int count)
+{
+    if (!config.is_initialized) {
+        parse_config();
+    }
+    if (!config.is_initialized) {
+        return -1;
+    }
+
+    if (config.DEBUG_MODE_VAR >= 2) {
+        fprintf(stderr, "xover: getdents: fd=%d, count=%u\n", fd, count);
+    }
+
+    if (!orig.getdents) {
+        func_ptr_union u;
+        u.void_ptr = dlsym(RTLD_NEXT, "getdents");
+        if (!u.void_ptr) {
+            u.getdents_func = NULL;
+        }
+        orig.getdents = u.getdents_func;
+        if (!orig.getdents) return -1;
+    }
+
+    int ret = orig.getdents(fd, dirp, count);
+
+    if (ret > 0 && config.DEBUG_MODE_VAR >= 2) {
+        fprintf(stderr, "xover: getdents: returned %d bytes\n", ret);
+    }
+
+    return ret;
+}
+
+static long xover_getdents64(int fd, void *dirp, unsigned long count)
+{
+    if (!config.is_initialized) {
+        parse_config();
+    }
+    if (!config.is_initialized) {
+        return -1;
+    }
+
+    if (config.DEBUG_MODE_VAR >= 2) {
+        fprintf(stderr, "xover: getdents64: fd=%d, count=%lu\n", fd, count);
+    }
+
+    if (!orig.getdents64) {
+        func_ptr_union u;
+        u.void_ptr = dlsym(RTLD_NEXT, "getdents64");
+        if (!u.void_ptr) {
+            u.getdents64_func = NULL;
+        }
+        orig.getdents64 = u.getdents64_func;
+        if (!orig.getdents64) return -1;
+    }
+
+    long ret = orig.getdents64(fd, dirp, count);
+
+    if (ret > 0 && config.DEBUG_MODE_VAR >= 2) {
+        fprintf(stderr, "xover: getdents64: returned %ld bytes\n", ret);
+    }
+
+    return ret;
+}
+
+#ifdef FTW
+static int xover_ftw(const char *pathname, int (*fn)(const char *, const struct stat *, int), int nopenfd)
+{
+    if (!config.is_initialized) {
+        parse_config();
+    }
+    if (!config.is_initialized) {
+        return -1;
+    }
+
+    if (config.DEBUG_MODE_VAR >= 2) {
+        fprintf(stderr, "xover: ftw: %s\n", pathname);
+    }
+
+    char pathbuf[MAXPATH];
+    const char *resolved = resolve_path(pathname, AT_FDCWD, pathbuf, sizeof(pathbuf));
+    if (!resolved) {
+        return -1;
+    }
+
+    if (!orig.ftw) {
+        func_ptr_union u;
+        u.void_ptr = get_orig_func("ftw");
+        orig.ftw = u.ftw_func;
+        if (!orig.ftw) return -1;
+    }
+
+    return orig.ftw(resolved, fn, nopenfd);
+}
+
+static int xover_nftw(const char *pathname, int (*fn)(const char *, const struct stat *, int, struct FTW *), int nopenfd, int flags)
+{
+    if (!config.is_initialized) {
+        parse_config();
+    }
+    if (!config.is_initialized) {
+        return -1;
+    }
+
+    if (config.DEBUG_MODE_VAR >= 2) {
+        fprintf(stderr, "xover: nftw: %s\n", pathname);
+    }
+
+    char pathbuf[MAXPATH];
+    const char *resolved = resolve_path(pathname, AT_FDCWD, pathbuf, sizeof(pathbuf));
+    if (!resolved) {
+        return -1;
+    }
+
+    if (!orig.nftw) {
+        func_ptr_union u;
+        u.void_ptr = get_orig_func("nftw");
+        orig.nftw = u.nftw_func;
+        if (!orig.nftw) return -1;
+    }
+
+    return orig.nftw(resolved, fn, nopenfd, flags);
+}
+#endif
 
 /* Symlink operation implementations */
 static ssize_t xover_readlink(const char *pathname, char *buf, size_t bufsiz)
@@ -723,7 +1139,34 @@ static ssize_t xover_readlink(const char *pathname, char *buf, size_t bufsiz)
         if (!orig.readlink) return -1;
     }
 
-    return orig.readlink(resolved, buf, bufsiz);
+    ssize_t ret = orig.readlink(resolved, buf, bufsiz);
+    if (ret >= 0) {
+        /* Check if the readlink result needs to be redirected back */
+        for (int i = 0; i < config.n_overrides; i++) {
+            if (path_starts_with(buf, config.paths_to[i])) {
+                size_t to_len = strlen(config.paths_to[i]);
+                size_t from_len = strlen(config.paths_from[i]);
+                char new_buf[MAXPATH];
+                if (to_len + strlen(buf + to_len) + from_len + 2 >= bufsiz) {
+                    errno = ERANGE;
+                    return -1;
+                }
+                strcpy(new_buf, config.paths_from[i]);
+                if (buf[to_len] == '/') {
+                    strcat(new_buf, buf + to_len);
+                } else if (new_buf[from_len-1] != '/') {
+                    strcat(new_buf, "/");
+                    strcat(new_buf, buf + to_len);
+                } else {
+                    strcat(new_buf, buf + to_len);
+                }
+                strncpy(buf, new_buf, bufsiz);
+                ret = strlen(buf);
+                break;
+            }
+        }
+    }
+    return ret;
 }
 
 static ssize_t xover_readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsiz)
@@ -752,9 +1195,62 @@ static ssize_t xover_readlinkat(int dirfd, const char *pathname, char *buf, size
         if (!orig.readlinkat) return -1;
     }
 
-    return orig.readlinkat(dirfd, resolved, buf, bufsiz);
+    ssize_t ret = orig.readlinkat(dirfd, resolved, buf, bufsiz);
+    if (ret >= 0) {
+        /* Check if the readlinkat result needs to be redirected back */
+        for (int i = 0; i < config.n_overrides; i++) {
+            if (path_starts_with(buf, config.paths_to[i])) {
+                size_t to_len = strlen(config.paths_to[i]);
+                size_t from_len = strlen(config.paths_from[i]);
+                char new_buf[MAXPATH];
+                if (to_len + strlen(buf + to_len) + from_len + 2 >= bufsiz) {
+                    errno = ERANGE;
+                    return -1;
+                }
+                strcpy(new_buf, config.paths_from[i]);
+                if (buf[to_len] == '/') {
+                    strcat(new_buf, buf + to_len);
+                } else if (new_buf[from_len-1] != '/') {
+                    strcat(new_buf, "/");
+                    strcat(new_buf, buf + to_len);
+                } else {
+                    strcat(new_buf, buf + to_len);
+                }
+                strncpy(buf, new_buf, bufsiz);
+                ret = strlen(buf);
+                break;
+            }
+        }
+    }
+    return ret;
 }
 
+/* Closedir implementation */
+static int xover_closedir(DIR *dirp)
+{
+    if (!config.is_initialized) {
+        parse_config();
+    }
+    if (!config.is_initialized) {
+        return -1;
+    }
+
+    if (config.DEBUG_MODE_VAR >= 2) {
+        fprintf(stderr, "xover: closedir: called\n");
+    }
+
+    if (!orig.closedir) {
+        func_ptr_union u;
+        u.void_ptr = get_orig_func("closedir");
+        orig.closedir = u.closedir_func;
+        if (!orig.closedir) return -1;
+    }
+
+    remove_dir_wrapper(dirp);
+    return orig.closedir(dirp);
+}
+
+/* Public API implementations */
 int creat(const char *pathname, mode_t mode)
 {
     return xover_open(pathname, O_CREAT|O_WRONLY|O_TRUNC, mode);
@@ -827,8 +1323,58 @@ int unlinkat(int dirfd, const char *pathname, int flags)
 
 DIR *opendir(const char *pathname)
 {
-    return xover_opendir(pathname);
+    DIR *dir = xover_opendir(pathname);
+    if (dir) {
+        get_dir_wrapper(dir, pathname);
+    }
+    return dir;
 }
+
+struct dirent *readdir(DIR *dirp)
+{
+    return xover_readdir(dirp);
+}
+
+struct dirent64 *readdir64(DIR *dirp)
+{
+    return xover_readdir64(dirp);
+}
+
+int scandir(const char *pathname, struct dirent ***namelist,
+            int (*select)(const struct dirent *),
+            int (*compar)(const struct dirent **, const struct dirent **))
+{
+    return xover_scandir(pathname, namelist, select, compar);
+}
+
+int scandir64(const char *pathname, struct dirent64 ***namelist,
+              int (*select)(const struct dirent64 *),
+              int (*compar)(const struct dirent64 **, const struct dirent64 **))
+{
+    return xover_scandir64(pathname, namelist, select, compar);
+}
+
+int getdents(int fd, struct dirent *dirp, size_t count)
+{
+    return xover_getdents(fd, dirp, count);
+}
+
+long getdents64(int fd, void *dirp, unsigned long count)
+{
+    return xover_getdents64(fd, dirp, count);
+}
+
+#ifdef FTW
+int ftw(const char *pathname, int (*fn)(const char *, const struct stat *, int), int nopenfd)
+{
+    return xover_ftw(pathname, fn, nopenfd);
+}
+
+int nftw(const char *pathname, int (*fn)(const char *, const struct stat *, int, struct FTW *), int nopenfd, int flags)
+{
+    return xover_nftw(pathname, fn, nopenfd, flags);
+}
+#endif
 
 ssize_t readlink(const char *pathname, char *buf, size_t bufsiz)
 {
@@ -838,4 +1384,9 @@ ssize_t readlink(const char *pathname, char *buf, size_t bufsiz)
 ssize_t readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsiz)
 {
     return xover_readlinkat(dirfd, pathname, buf, bufsiz);
+}
+
+int closedir(DIR *dirp)
+{
+    return xover_closedir(dirp);
 }
