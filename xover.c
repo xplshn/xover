@@ -50,6 +50,12 @@ typedef union {
 #define AT_REMOVEDIR 0x200
 #endif
 
+/* MISC */
+#define BLUE "\x1b[0;34m"
+#define YELLOW "\x1b[0;33m"
+#define RED "\x1b[31m"
+#define RESET "\x1b[m"
+
 /* cfg limits */
 #define MAXPATH 4096
 #define MAXOVERRIDES 128
@@ -60,7 +66,7 @@ struct xover_cfg {
     char paths_to[MAXOVERRIDES][MAXPATH];
     int n_overrides;
     int do_absolutize;
-    int do_debug;
+    int DEBUG_MODE_VAR;
     int is_initialized;
 };
 
@@ -72,7 +78,7 @@ struct xover_cfg {
 static struct xover_cfg config = {
     .n_overrides = 0,
     .do_absolutize = 1,
-    .do_debug = DEBUG_FLAG,
+    .DEBUG_MODE_VAR = DEBUG_FLAG,
     .is_initialized = 0
 };
 
@@ -134,7 +140,7 @@ static int absolutize_path(char *outpath, int outpath_size, const char *pathname
 
             ssize_t ret = readlink(proc_path, outpath, outpath_size - 1);
             if (ret == -1) {
-                if (config.do_debug) {
+                if (config.DEBUG_MODE_VAR >= 1) {
                     fprintf(stderr, "xover: warning: cannot readlink %s, assuming root\n", proc_path);
                 }
                 len = 0;
@@ -181,7 +187,7 @@ static const char *resolve_path(const char *pathname, int dirfd, char *pathbuf, 
         }
         resolved = pathbuf;
 
-        if (config.do_debug) {
+        if (config.DEBUG_MODE_VAR >= 2) {
             fprintf(stderr, "xover: absolutized: %s\n", resolved);
         }
     }
@@ -190,8 +196,8 @@ static const char *resolve_path(const char *pathname, int dirfd, char *pathbuf, 
     for (int i = 0; i < config.n_overrides; i++) {
         if (strcmp(resolved, config.paths_from[i]) == 0) {
             resolved = config.paths_to[i];
-            if (config.do_debug) {
-                fprintf(stderr, "xover: overridden: %s\n", resolved);
+            if (config.DEBUG_MODE_VAR >= 1) {
+                fprintf(stderr, "xover: %soverridden%s: %s%s%s with %s%s%s\n", RED, RESET, BLUE, resolved, RESET, BLUE, config.paths_from[i], RESET);
             }
             break;
         }
@@ -205,7 +211,7 @@ static void parse_config(void)
 {
     const char *env = getenv("XOVER");
     if (!env) {
-        if (config.do_debug) {
+        if (config.DEBUG_MODE_VAR >= 1) {
             fprintf(stderr, "Usage: LD_PRELOAD=libxover.so XOVER=/path/from=/path/to,/path2/from=/path2/to program [args...]\n");
             fprintf(stderr, "    Special flags: debug, noabs\n");
             fprintf(stderr, "    Use backslash to escape commas and equals\n");
@@ -245,7 +251,7 @@ static void parse_config(void)
 
             if (parsing_key) {
                 if (strcmp(buffer, "debug") == 0) {
-                    config.do_debug = 1;
+                    config.DEBUG_MODE_VAR = 1;
                 } else if (strcmp(buffer, "noabs") == 0) {
                     config.do_absolutize = 0;
                 } else if (strlen(buffer) > 0) {
@@ -256,7 +262,7 @@ static void parse_config(void)
                 strncpy(config.paths_to[config.n_overrides], buffer, MAXPATH-1);
                 config.paths_to[config.n_overrides][MAXPATH-1] = '\0';
 
-                if (config.do_debug) {
+                if (config.DEBUG_MODE_VAR >= 1) {
                     fprintf(stderr, "xover: mapping: %s -> %s\n",
                            config.paths_from[config.n_overrides],
                            config.paths_to[config.n_overrides]);
@@ -307,7 +313,7 @@ static int xover_openat(int dirfd, const char *pathname, int flags, mode_t mode)
         return -1;
     }
 
-    if (config.do_debug) {
+    if (config.DEBUG_MODE_VAR >= 3) {
         fprintf(stderr, "xover: openat: %s (dirfd=%d, flags=%d, mode=%o)\n",
                pathname, dirfd, flags, mode);
     }
@@ -342,362 +348,6 @@ static FILE *xover_fopen(const char *pathname, const char *mode)
         return NULL;
     }
     return fdopen(fd, mode);
-}
-
-/* Stat family implementations */
-static int xover_stat(const char *pathname, struct stat *statbuf)
-{
-    if (!config.is_initialized) {
-        parse_config();
-    }
-    if (!config.is_initialized) {
-        return -1;
-    }
-
-    if (config.do_debug) {
-        fprintf(stderr, "xover: stat: %s\n", pathname);
-    }
-
-    char pathbuf[MAXPATH];
-    const char *resolved = resolve_path(pathname, AT_FDCWD, pathbuf, sizeof(pathbuf));
-    if (!resolved) {
-        return -1;
-    }
-
-    if (!orig.stat) {
-        func_ptr_union u;
-        u.void_ptr = get_orig_func("stat");
-        orig.stat = u.stat_func;
-        if (!orig.stat) return -1;
-    }
-
-    return orig.stat(resolved, statbuf);
-}
-
-static int xover_lstat(const char *pathname, struct stat *statbuf)
-{
-    if (!config.is_initialized) {
-        parse_config();
-    }
-    if (!config.is_initialized) {
-        return -1;
-    }
-
-    if (config.do_debug) {
-        fprintf(stderr, "xover: lstat: %s\n", pathname);
-    }
-
-    char pathbuf[MAXPATH];
-    const char *resolved = resolve_path(pathname, AT_FDCWD, pathbuf, sizeof(pathbuf));
-    if (!resolved) {
-        return -1;
-    }
-
-    if (!orig.lstat) {
-        func_ptr_union u;
-        u.void_ptr = get_orig_func("lstat");
-        orig.lstat = u.lstat_func;
-        if (!orig.lstat) return -1;
-    }
-
-    return orig.lstat(resolved, statbuf);
-}
-
-static int xover_fstatat(int dirfd, const char *pathname, struct stat *statbuf, int flags)
-{
-    if (!config.is_initialized) {
-        parse_config();
-    }
-    if (!config.is_initialized) {
-        return -1;
-    }
-
-    if (config.do_debug) {
-        fprintf(stderr, "xover: fstatat: %s (dirfd=%d, flags=%d)\n", pathname, dirfd, flags);
-    }
-
-    char pathbuf[MAXPATH];
-    const char *resolved = resolve_path(pathname, dirfd, pathbuf, sizeof(pathbuf));
-    if (!resolved) {
-        return -1;
-    }
-
-    if (!orig.fstatat) {
-        func_ptr_union u;
-        u.void_ptr = get_orig_func("fstatat");
-        if (!u.void_ptr) {
-            u.void_ptr = get_orig_func("newfstatat");
-        }
-        orig.fstatat = u.fstatat_func;
-        if (!orig.fstatat) return -1;
-    }
-
-    return orig.fstatat(dirfd, resolved, statbuf, flags);
-}
-
-/* Access function implementations */
-static int xover_access(const char *pathname, int mode)
-{
-    if (!config.is_initialized) {
-        parse_config();
-    }
-    if (!config.is_initialized) {
-        return -1;
-    }
-
-    if (config.do_debug) {
-        fprintf(stderr, "xover: access: %s (mode=%d)\n", pathname, mode);
-    }
-
-    char pathbuf[MAXPATH];
-    const char *resolved = resolve_path(pathname, AT_FDCWD, pathbuf, sizeof(pathbuf));
-    if (!resolved) {
-        return -1;
-    }
-
-    if (!orig.access) {
-        func_ptr_union u;
-        u.void_ptr = get_orig_func("access");
-        orig.access = u.access_func;
-        if (!orig.access) return -1;
-    }
-
-    return orig.access(resolved, mode);
-}
-
-static int xover_faccessat(int dirfd, const char *pathname, int mode, int flags)
-{
-    if (!config.is_initialized) {
-        parse_config();
-    }
-    if (!config.is_initialized) {
-        return -1;
-    }
-
-    if (config.do_debug) {
-        fprintf(stderr, "xover: faccessat: %s (dirfd=%d, mode=%d, flags=%d)\n",
-               pathname, dirfd, mode, flags);
-    }
-
-    char pathbuf[MAXPATH];
-    const char *resolved = resolve_path(pathname, dirfd, pathbuf, sizeof(pathbuf));
-    if (!resolved) {
-        return -1;
-    }
-
-    if (!orig.faccessat) {
-        func_ptr_union u;
-        u.void_ptr = get_orig_func("faccessat");
-        orig.faccessat = u.faccessat_func;
-        if (!orig.faccessat) return -1;
-    }
-
-    return orig.faccessat(dirfd, resolved, mode, flags);
-}
-
-/* Directory operation implementations */
-static int xover_mkdir(const char *pathname, mode_t mode)
-{
-    if (!config.is_initialized) {
-        parse_config();
-    }
-    if (!config.is_initialized) {
-        return -1;
-    }
-
-    if (config.do_debug) {
-        fprintf(stderr, "xover: mkdir: %s (mode=%o)\n", pathname, mode);
-    }
-
-    char pathbuf[MAXPATH];
-    const char *resolved = resolve_path(pathname, AT_FDCWD, pathbuf, sizeof(pathbuf));
-    if (!resolved) {
-        return -1;
-    }
-
-    if (!orig.mkdir) {
-        func_ptr_union u;
-        u.void_ptr = get_orig_func("mkdir");
-        orig.mkdir = u.mkdir_func;
-        if (!orig.mkdir) return -1;
-    }
-
-    return orig.mkdir(resolved, mode);
-}
-
-static int xover_mkdirat(int dirfd, const char *pathname, mode_t mode)
-{
-    if (!config.is_initialized) {
-        parse_config();
-    }
-    if (!config.is_initialized) {
-        return -1;
-    }
-
-    if (config.do_debug) {
-        fprintf(stderr, "xover: mkdirat: %s (dirfd=%d, mode=%o)\n", pathname, dirfd, mode);
-    }
-
-    char pathbuf[MAXPATH];
-    const char *resolved = resolve_path(pathname, dirfd, pathbuf, sizeof(pathbuf));
-    if (!resolved) {
-        return -1;
-    }
-
-    if (!orig.mkdirat) {
-        func_ptr_union u;
-        u.void_ptr = get_orig_func("mkdirat");
-        orig.mkdirat = u.mkdirat_func;
-        if (!orig.mkdirat) return -1;
-    }
-
-    return orig.mkdirat(dirfd, resolved, mode);
-}
-
-static int xover_rmdir(const char *pathname)
-{
-    if (!config.is_initialized) {
-        parse_config();
-    }
-    if (!config.is_initialized) {
-        return -1;
-    }
-
-    if (config.do_debug) {
-        fprintf(stderr, "xover: rmdir: %s\n", pathname);
-    }
-
-    char pathbuf[MAXPATH];
-    const char *resolved = resolve_path(pathname, AT_FDCWD, pathbuf, sizeof(pathbuf));
-    if (!resolved) {
-        return -1;
-    }
-
-    if (!orig.rmdir) {
-        func_ptr_union u;
-        u.void_ptr = get_orig_func("rmdir");
-        orig.rmdir = u.rmdir_func;
-        if (!orig.rmdir) return -1;
-    }
-
-    return orig.rmdir(resolved);
-}
-
-static int xover_unlinkat(int dirfd, const char *pathname, int flags)
-{
-    if (!config.is_initialized) {
-        parse_config();
-    }
-    if (!config.is_initialized) {
-        return -1;
-    }
-
-    if (config.do_debug) {
-        fprintf(stderr, "xover: unlinkat: %s (dirfd=%d, flags=%d)\n", pathname, dirfd, flags);
-    }
-
-    char pathbuf[MAXPATH];
-    const char *resolved = resolve_path(pathname, dirfd, pathbuf, sizeof(pathbuf));
-    if (!resolved) {
-        return -1;
-    }
-
-    if (!orig.unlinkat) {
-        func_ptr_union u;
-        u.void_ptr = get_orig_func("unlinkat");
-        orig.unlinkat = u.unlinkat_func;
-        if (!orig.unlinkat) return -1;
-    }
-
-    return orig.unlinkat(dirfd, resolved, flags);
-}
-
-static DIR *xover_opendir(const char *pathname)
-{
-    if (!config.is_initialized) {
-        parse_config();
-    }
-    if (!config.is_initialized) {
-        return NULL;
-    }
-
-    if (config.do_debug) {
-        fprintf(stderr, "xover: opendir: %s\n", pathname);
-    }
-
-    char pathbuf[MAXPATH];
-    const char *resolved = resolve_path(pathname, AT_FDCWD, pathbuf, sizeof(pathbuf));
-    if (!resolved) {
-        return NULL;
-    }
-
-    if (!orig.opendir) {
-        func_ptr_union u;
-        u.void_ptr = get_orig_func("opendir");
-        orig.opendir = u.opendir_func;
-        if (!orig.opendir) return NULL;
-    }
-
-    return orig.opendir(resolved);
-}
-
-/* Symlink operation implementations */
-static ssize_t xover_readlink(const char *pathname, char *buf, size_t bufsiz)
-{
-    if (!config.is_initialized) {
-        parse_config();
-    }
-    if (!config.is_initialized) {
-        return -1;
-    }
-
-    if (config.do_debug) {
-        fprintf(stderr, "xover: readlink: %s\n", pathname);
-    }
-
-    char pathbuf[MAXPATH];
-    const char *resolved = resolve_path(pathname, AT_FDCWD, pathbuf, sizeof(pathbuf));
-    if (!resolved) {
-        return -1;
-    }
-
-    if (!orig.readlink) {
-        func_ptr_union u;
-        u.void_ptr = get_orig_func("readlink");
-        orig.readlink = u.readlink_func;
-        if (!orig.readlink) return -1;
-    }
-
-    return orig.readlink(resolved, buf, bufsiz);
-}
-
-static ssize_t xover_readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsiz)
-{
-    if (!config.is_initialized) {
-        parse_config();
-    }
-    if (!config.is_initialized) {
-        return -1;
-    }
-
-    if (config.do_debug) {
-        fprintf(stderr, "xover: readlinkat: %s (dirfd=%d)\n", pathname, dirfd);
-    }
-
-    char pathbuf[MAXPATH];
-    const char *resolved = resolve_path(pathname, dirfd, pathbuf, sizeof(pathbuf));
-    if (!resolved) {
-        return -1;
-    }
-
-    if (!orig.readlinkat) {
-        func_ptr_union u;
-        u.void_ptr = get_orig_func("readlinkat");
-        orig.readlinkat = u.readlinkat_func;
-        if (!orig.readlinkat) return -1;
-    }
-
-    return orig.readlinkat(dirfd, resolved, buf, bufsiz);
 }
 
 /* Public API implementations with proper variadic handling */
@@ -747,6 +397,362 @@ int openat64(int dirfd, const char *pathname, int flags, ...)
         va_end(args);
     }
     return xover_openat(dirfd, pathname, flags, mode);
+}
+
+/* Stat family implementations */
+static int xover_stat(const char *pathname, struct stat *statbuf)
+{
+    if (!config.is_initialized) {
+        parse_config();
+    }
+    if (!config.is_initialized) {
+        return -1;
+    }
+
+    if (config.DEBUG_MODE_VAR >= 3) {
+        fprintf(stderr, "xover: stat: %s\n", pathname);
+    }
+
+    char pathbuf[MAXPATH];
+    const char *resolved = resolve_path(pathname, AT_FDCWD, pathbuf, sizeof(pathbuf));
+    if (!resolved) {
+        return -1;
+    }
+
+    if (!orig.stat) {
+        func_ptr_union u;
+        u.void_ptr = get_orig_func("stat");
+        orig.stat = u.stat_func;
+        if (!orig.stat) return -1;
+    }
+
+    return orig.stat(resolved, statbuf);
+}
+
+static int xover_lstat(const char *pathname, struct stat *statbuf)
+{
+    if (!config.is_initialized) {
+        parse_config();
+    }
+    if (!config.is_initialized) {
+        return -1;
+    }
+
+    if (config.DEBUG_MODE_VAR >= 3) {
+        fprintf(stderr, "xover: lstat: %s\n", pathname);
+    }
+
+    char pathbuf[MAXPATH];
+    const char *resolved = resolve_path(pathname, AT_FDCWD, pathbuf, sizeof(pathbuf));
+    if (!resolved) {
+        return -1;
+    }
+
+    if (!orig.lstat) {
+        func_ptr_union u;
+        u.void_ptr = get_orig_func("lstat");
+        orig.lstat = u.lstat_func;
+        if (!orig.lstat) return -1;
+    }
+
+    return orig.lstat(resolved, statbuf);
+}
+
+static int xover_fstatat(int dirfd, const char *pathname, struct stat *statbuf, int flags)
+{
+    if (!config.is_initialized) {
+        parse_config();
+    }
+    if (!config.is_initialized) {
+        return -1;
+    }
+
+    if (config.DEBUG_MODE_VAR >= 3) {
+        fprintf(stderr, "xover: fstatat: %s (dirfd=%d, flags=%d)\n", pathname, dirfd, flags);
+    }
+
+    char pathbuf[MAXPATH];
+    const char *resolved = resolve_path(pathname, dirfd, pathbuf, sizeof(pathbuf));
+    if (!resolved) {
+        return -1;
+    }
+
+    if (!orig.fstatat) {
+        func_ptr_union u;
+        u.void_ptr = get_orig_func("fstatat");
+        if (!u.void_ptr) {
+            u.void_ptr = get_orig_func("newfstatat");
+        }
+        orig.fstatat = u.fstatat_func;
+        if (!orig.fstatat) return -1;
+    }
+
+    return orig.fstatat(dirfd, resolved, statbuf, flags);
+}
+
+/* Access function implementations */
+static int xover_access(const char *pathname, int mode)
+{
+    if (!config.is_initialized) {
+        parse_config();
+    }
+    if (!config.is_initialized) {
+        return -1;
+    }
+
+    if (config.DEBUG_MODE_VAR >= 3) {
+        fprintf(stderr, "xover: access: %s (mode=%d)\n", pathname, mode);
+    }
+
+    char pathbuf[MAXPATH];
+    const char *resolved = resolve_path(pathname, AT_FDCWD, pathbuf, sizeof(pathbuf));
+    if (!resolved) {
+        return -1;
+    }
+
+    if (!orig.access) {
+        func_ptr_union u;
+        u.void_ptr = get_orig_func("access");
+        orig.access = u.access_func;
+        if (!orig.access) return -1;
+    }
+
+    return orig.access(resolved, mode);
+}
+
+static int xover_faccessat(int dirfd, const char *pathname, int mode, int flags)
+{
+    if (!config.is_initialized) {
+        parse_config();
+    }
+    if (!config.is_initialized) {
+        return -1;
+    }
+
+    if (config.DEBUG_MODE_VAR >= 3) {
+        fprintf(stderr, "xover: faccessat: %s (dirfd=%d, mode=%d, flags=%d)\n",
+               pathname, dirfd, mode, flags);
+    }
+
+    char pathbuf[MAXPATH];
+    const char *resolved = resolve_path(pathname, dirfd, pathbuf, sizeof(pathbuf));
+    if (!resolved) {
+        return -1;
+    }
+
+    if (!orig.faccessat) {
+        func_ptr_union u;
+        u.void_ptr = get_orig_func("faccessat");
+        orig.faccessat = u.faccessat_func;
+        if (!orig.faccessat) return -1;
+    }
+
+    return orig.faccessat(dirfd, resolved, mode, flags);
+}
+
+/* Directory operation implementations */
+static int xover_mkdir(const char *pathname, mode_t mode)
+{
+    if (!config.is_initialized) {
+        parse_config();
+    }
+    if (!config.is_initialized) {
+        return -1;
+    }
+
+    if (config.DEBUG_MODE_VAR >= 2) {
+        fprintf(stderr, "xover: mkdir: %s (mode=%o)\n", pathname, mode);
+    }
+
+    char pathbuf[MAXPATH];
+    const char *resolved = resolve_path(pathname, AT_FDCWD, pathbuf, sizeof(pathbuf));
+    if (!resolved) {
+        return -1;
+    }
+
+    if (!orig.mkdir) {
+        func_ptr_union u;
+        u.void_ptr = get_orig_func("mkdir");
+        orig.mkdir = u.mkdir_func;
+        if (!orig.mkdir) return -1;
+    }
+
+    return orig.mkdir(resolved, mode);
+}
+
+static int xover_mkdirat(int dirfd, const char *pathname, mode_t mode)
+{
+    if (!config.is_initialized) {
+        parse_config();
+    }
+    if (!config.is_initialized) {
+        return -1;
+    }
+
+    if (config.DEBUG_MODE_VAR >= 2) {
+        fprintf(stderr, "xover: mkdirat: %s (dirfd=%d, mode=%o)\n", pathname, dirfd, mode);
+    }
+
+    char pathbuf[MAXPATH];
+    const char *resolved = resolve_path(pathname, dirfd, pathbuf, sizeof(pathbuf));
+    if (!resolved) {
+        return -1;
+    }
+
+    if (!orig.mkdirat) {
+        func_ptr_union u;
+        u.void_ptr = get_orig_func("mkdirat");
+        orig.mkdirat = u.mkdirat_func;
+        if (!orig.mkdirat) return -1;
+    }
+
+    return orig.mkdirat(dirfd, resolved, mode);
+}
+
+static int xover_rmdir(const char *pathname)
+{
+    if (!config.is_initialized) {
+        parse_config();
+    }
+    if (!config.is_initialized) {
+        return -1;
+    }
+
+    if (config.DEBUG_MODE_VAR >= 2) {
+        fprintf(stderr, "xover: rmdir: %s\n", pathname);
+    }
+
+    char pathbuf[MAXPATH];
+    const char *resolved = resolve_path(pathname, AT_FDCWD, pathbuf, sizeof(pathbuf));
+    if (!resolved) {
+        return -1;
+    }
+
+    if (!orig.rmdir) {
+        func_ptr_union u;
+        u.void_ptr = get_orig_func("rmdir");
+        orig.rmdir = u.rmdir_func;
+        if (!orig.rmdir) return -1;
+    }
+
+    return orig.rmdir(resolved);
+}
+
+static int xover_unlinkat(int dirfd, const char *pathname, int flags)
+{
+    if (!config.is_initialized) {
+        parse_config();
+    }
+    if (!config.is_initialized) {
+        return -1;
+    }
+
+    if (config.DEBUG_MODE_VAR >= 2) {
+        fprintf(stderr, "xover: unlinkat: %s (dirfd=%d, flags=%d)\n", pathname, dirfd, flags);
+    }
+
+    char pathbuf[MAXPATH];
+    const char *resolved = resolve_path(pathname, dirfd, pathbuf, sizeof(pathbuf));
+    if (!resolved) {
+        return -1;
+    }
+
+    if (!orig.unlinkat) {
+        func_ptr_union u;
+        u.void_ptr = get_orig_func("unlinkat");
+        orig.unlinkat = u.unlinkat_func;
+        if (!orig.unlinkat) return -1;
+    }
+
+    return orig.unlinkat(dirfd, resolved, flags);
+}
+
+static DIR *xover_opendir(const char *pathname)
+{
+    if (!config.is_initialized) {
+        parse_config();
+    }
+    if (!config.is_initialized) {
+        return NULL;
+    }
+
+    if (config.DEBUG_MODE_VAR >= 2) {
+        fprintf(stderr, "xover: opendir: %s\n", pathname);
+    }
+
+    char pathbuf[MAXPATH];
+    const char *resolved = resolve_path(pathname, AT_FDCWD, pathbuf, sizeof(pathbuf));
+    if (!resolved) {
+        return NULL;
+    }
+
+    if (!orig.opendir) {
+        func_ptr_union u;
+        u.void_ptr = get_orig_func("opendir");
+        orig.opendir = u.opendir_func;
+        if (!orig.opendir) return NULL;
+    }
+
+    return orig.opendir(resolved);
+}
+
+/* Symlink operation implementations */
+static ssize_t xover_readlink(const char *pathname, char *buf, size_t bufsiz)
+{
+    if (!config.is_initialized) {
+        parse_config();
+    }
+    if (!config.is_initialized) {
+        return -1;
+    }
+
+    if (config.DEBUG_MODE_VAR >= 3) {
+        fprintf(stderr, "xover: readlink: %s\n", pathname);
+    }
+
+    char pathbuf[MAXPATH];
+    const char *resolved = resolve_path(pathname, AT_FDCWD, pathbuf, sizeof(pathbuf));
+    if (!resolved) {
+        return -1;
+    }
+
+    if (!orig.readlink) {
+        func_ptr_union u;
+        u.void_ptr = get_orig_func("readlink");
+        orig.readlink = u.readlink_func;
+        if (!orig.readlink) return -1;
+    }
+
+    return orig.readlink(resolved, buf, bufsiz);
+}
+
+static ssize_t xover_readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsiz)
+{
+    if (!config.is_initialized) {
+        parse_config();
+    }
+    if (!config.is_initialized) {
+        return -1;
+    }
+
+    if (config.DEBUG_MODE_VAR >= 3) {
+        fprintf(stderr, "xover: readlinkat: %s (dirfd=%d)\n", pathname, dirfd);
+    }
+
+    char pathbuf[MAXPATH];
+    const char *resolved = resolve_path(pathname, dirfd, pathbuf, sizeof(pathbuf));
+    if (!resolved) {
+        return -1;
+    }
+
+    if (!orig.readlinkat) {
+        func_ptr_union u;
+        u.void_ptr = get_orig_func("readlinkat");
+        orig.readlinkat = u.readlinkat_func;
+        if (!orig.readlinkat) return -1;
+    }
+
+    return orig.readlinkat(dirfd, resolved, buf, bufsiz);
 }
 
 int creat(const char *pathname, mode_t mode)
